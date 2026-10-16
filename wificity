@@ -1,0 +1,234 @@
+#!/bin/bash
+# WifiCity AutoLogin: signs in to the Cité Internationale Universitaire de Paris Wi-Fi portal.
+# Driven by the WifiCity AutoLogin menu bar app; can also be used from Terminal.
+#
+#   wificity connect      check now and sign in if needed
+#   wificity logout       sign out of the portal
+#   wificity status       show the current state
+#   wificity log          follow the log
+#   wificity report       write a diagnostic report to the Desktop (contains no password)
+#   wificity uninstall    remove WifiCity AutoLogin
+#   wificity run [why]    single check, used by the menu bar app
+
+PORTAL_HOST="10.254.0.254"                         # credentials are only ever sent to this host
+PROBE_URL="http://captive.apple.com/hotspot-detect.html"
+LOGOUT_URL="https://$PORTAL_HOST:1003/logout?0"   # signs out whichever device makes the request
+KC_SERVICE="WifiCityAutoLogin"
+
+APP_DIR="$HOME/Library/Application Support/WifiCityAutoLogin"
+STATE_DIR="$APP_DIR/state"
+LOG="$HOME/Library/Logs/WifiCityAutoLogin.log"
+MENU_APP="$HOME/Applications/WifiCity AutoLogin.app"
+
+mkdir -p "$STATE_DIR" "$(dirname "$LOG")"
+VERBOSE=0
+
+# Wi-Fi device (normally en0), cached.
+IFACE=$(cat "$STATE_DIR/iface" 2>/dev/null)
+if [ -z "$IFACE" ]; then
+  IFACE=$(networksetup -listallhardwareports 2>/dev/null | awk '/Hardware Port: Wi-Fi/{getline; print $2; exit}')
+  IFACE="${IFACE:-en0}"
+  echo "$IFACE" > "$STATE_DIR/iface"
+fi
+
+# Until you sign in, macOS gives a captive network no default route or DNS; only the Wi-Fi
+# interface's own scoped route works. Every request is therefore bound to that interface.
+wifi_curl() {
+  if [ -n "$(ipconfig getifaddr "$IFACE" 2>/dev/null)" ]; then
+    curl --interface "$IFACE" "$@"
+  else
+    curl "$@"
+  fi
+}
+
+log() {
+  local line
+  line="$(date '+%Y-%m-%d %H:%M:%S') $*"
+  echo "$line" >> "$LOG"
+  [ "$VERBOSE" = 1 ] && echo "$line"
+}
+
+rotate_log() {
+  [ -f "$LOG" ] && [ "$(stat -f%z "$LOG")" -gt 2000000 ] && mv -f "$LOG" "$LOG.old"
+}
+
+network_summary() {
+  local ip gw wifi_gw
+  ip=$(ipconfig getifaddr "$IFACE" 2>/dev/null)
+  gw=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
+  wifi_gw=$(route -n get -ifscope "$IFACE" default 2>/dev/null | awk '/gateway:/{print $2}')
+  echo "ip=${ip:-none} gw=${gw:-none} wifi-gw=${wifi_gw:-none}"
+}
+
+# Records a value and logs it only when it changes, so the log stays short.
+note_state() {
+  local f="$STATE_DIR/$1"
+  if [ "$(cat "$f" 2>/dev/null)" != "$2" ]; then
+    echo "$2" > "$f"
+    log "[$1] $2"
+  fi
+}
+
+# Prints ONLINE, NONET, CAPTIVE <portal-url> or OTHER (a different network's login page).
+probe() {
+  local hdr="$STATE_DIR/probe.hdr" body="$STATE_DIR/probe.body" url dns ip
+  : > "$hdr"; : > "$body"
+  wifi_curl -s -m 5 -D "$hdr" -o "$body" "$PROBE_URL" 2>/dev/null
+  if [ $? -eq 6 ]; then
+    # Name lookup failed: ask the Wi-Fi network's DNS server directly.
+    dns=$(ipconfig getoption "$IFACE" domain_name_server 2>/dev/null)
+    [ -n "$dns" ] && ip=$(dig +short +time=2 +tries=1 -b "$(ipconfig getifaddr "$IFACE")" @"$dns" captive.apple.com A 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
+    if [ -n "$ip" ]; then
+      wifi_curl -s -m 5 -D "$hdr" -o "$body" --resolve "captive.apple.com:80:$ip" "$PROBE_URL" 2>/dev/null
+    else
+      # No DNS at all: 1.1.1.1 answers plain HTTP, and the portal intercepts it like any other request.
+      wifi_curl -s -m 5 -D "$hdr" -o "$body" http://1.1.1.1/ 2>/dev/null
+      grep -qi '^server: cloudflare' "$hdr" && { echo ONLINE; return; }
+    fi
+  fi
+  if grep -q "Success</BODY>" "$body" 2>/dev/null; then echo ONLINE; return; fi
+  if [ ! -s "$hdr" ] && [ ! -s "$body" ]; then echo NONET; return; fi
+  url=$(cat "$hdr" "$body" | grep -oE "https?://${PORTAL_HOST//./\\.}(:[0-9]+)?/[^\"' <>]*" | head -1)
+  if [ -n "$url" ]; then echo "CAPTIVE $url"; else echo OTHER; fi
+}
+
+get_creds() {
+  USERNAME=$(security find-generic-password -s "$KC_SERVICE" 2>/dev/null | awk -F'"' '/"acct"/{print $4}')
+  PASSWORD=$(security find-generic-password -s "$KC_SERVICE" -w 2>/dev/null)
+  [ -n "$USERNAME" ] && [ -n "$PASSWORD" ]
+}
+
+# Loads the portal's login page, fills in the form and submits it, as a browser would.
+login() {
+  local portal_url="$1"
+  local jar="$STATE_DIR/cookies" page="$STATE_DIR/portal.html" resp="$STATE_DIR/response.html"
+  rm -f "$jar"
+  wifi_curl -sk -L -m 8 -c "$jar" -b "$jar" -o "$page" "$portal_url"
+  if [ ! -s "$page" ]; then log "Portal page did not load ($portal_url)"; return 1; fi
+
+  # Line 1: form action. Then name<TAB>value per hidden field, and the names of the
+  # username and password fields as __USER__<TAB>name and __PASS__<TAB>name.
+  local parsed
+  parsed=$(perl -0777 -ne '
+    my ($form) = /(<form\b.*?<\/form>)/is or exit 1;
+    my ($action) = $form =~ /<form\b[^>]*\baction\s*=\s*["\x27]([^"\x27]*)["\x27]/is;
+    print(($action // "/"), "\n");
+    my ($user, $pass);
+    while ($form =~ /<input\b([^>]*)>/gis) {
+      my $a = $1;
+      my ($t) = $a =~ /\btype\s*=\s*["\x27]?([\w-]+)/i;  $t = lc($t // "text");
+      my ($n) = $a =~ /\bname\s*=\s*["\x27]([^"\x27]*)["\x27]/i;  next unless defined $n && length $n;
+      my ($v) = $a =~ /\bvalue\s*=\s*["\x27]([^"\x27]*)["\x27]/i;  $v //= "";
+      if    ($t eq "hidden")   { print "$n\t$v\n" }
+      elsif ($t eq "password") { $pass //= $n }
+      elsif ($t =~ /^(text|email)$/) { $user //= $n }
+    }
+    print "__USER__\t", ($user // "username"), "\n";
+    print "__PASS__\t", ($pass // "password"), "\n";
+  ' "$page")
+  if [ -z "$parsed" ]; then log "No login form found on the portal page"; return 1; fi
+
+  local action base post_url user_field pass_field
+  action=$(echo "$parsed" | head -1)
+  user_field=$(echo "$parsed" | awk -F'\t' '$1=="__USER__"{print $2}')
+  pass_field=$(echo "$parsed" | awk -F'\t' '$1=="__PASS__"{print $2}')
+  base=$(echo "$portal_url" | grep -oE '^https?://[^/]+')
+  case "$action" in
+    http*) post_url="$action" ;;
+    /*)    post_url="$base$action" ;;
+    *)     post_url="${portal_url%/*}/$action" ;;
+  esac
+
+  # Never send the password anywhere but the portal.
+  if ! echo "$post_url" | grep -qE "^https?://${PORTAL_HOST//./\\.}(:|/)"; then
+    log "Refused: the form submits to an unexpected address ($post_url)"; return 1
+  fi
+  if ! get_creds; then log "No credentials in the Keychain. Run the installer again."; return 1; fi
+
+  local args=() n v code
+  while IFS=$'\t' read -r n v; do
+    [ "$n" = "__USER__" ] || [ "$n" = "__PASS__" ] && continue
+    args+=(--data-urlencode "$n=$v")
+  done < <(echo "$parsed" | sed 1d)
+  args+=(--data-urlencode "$user_field=$USERNAME" --data-urlencode "$pass_field=$PASSWORD")
+
+  code=$(wifi_curl -sk -m 10 -c "$jar" -b "$jar" -e "$portal_url" -o "$resp" -w '%{http_code}' "${args[@]}" "$post_url")
+  log "Signing in as $USERNAME (HTTP $code)"
+  if grep -qiE 'failed|invalid|incorrect|denied' "$resp"; then
+    log "The portal rejected the sign-in: $(sed 's/<[^>]*>/ /g' "$resp" | tr -s ' \n' ' ' | cut -c1-200)"
+  fi
+  return 0
+}
+
+run_cycle() {
+  mkdir "$STATE_DIR/lock" 2>/dev/null || return   # another check is already running
+  trap 'rmdir "$STATE_DIR/lock" 2>/dev/null' EXIT
+  rotate_log
+  note_state network "$(network_summary)"
+
+  # Wi-Fi can take a few seconds to come up after wake, so keep trying for about 30 s.
+  local i result
+  for i in $(seq 1 10); do
+    result=$(probe)
+    case "$result" in
+      ONLINE)
+        note_state status "online"; return ;;
+      CAPTIVE*)
+        note_state status "portal"
+        if login "${result#CAPTIVE }"; then
+          sleep 2
+          if [ "$(probe)" = ONLINE ]; then
+            log "Signed in, internet is back"
+            date '+%H:%M:%S' > "$STATE_DIR/last-login"
+            note_state status "online"
+            killall "Captive Network Assistant" 2>/dev/null   # close the macOS login window
+            return
+          fi
+          log "Still behind the portal after attempt $i"
+        fi
+        sleep 5 ;;
+      NONET)
+        note_state status "no network"; sleep 3 ;;
+      OTHER)
+        note_state status "other portal"; return ;;
+    esac
+  done
+  log "Not signed in yet ($result), will try again on the next check"
+}
+
+case "${1:-status}" in
+  run)
+    [ -n "$2" ] && log "Check: $2"
+    run_cycle ;;
+  connect)
+    VERBOSE=1; rm -f "$STATE_DIR/status"; run_cycle ;;
+  logout)
+    code=$(wifi_curl -sk -m 6 -o /dev/null -w '%{http_code}' "$LOGOUT_URL")
+    log "Signed out (HTTP $code)"; echo "Signed out" ;;
+  status)
+    if pgrep -qf "WifiCity AutoLogin.app/Contents/MacOS"; then echo "Auto-login: on"; else echo "Auto-login: off (app not running)"; fi
+    if get_creds; then echo "Account: $USERNAME"; else echo "Account: none saved"; fi
+    echo "Connection: $(probe | cut -d' ' -f1)"
+    echo "Network: $(network_summary)" ;;
+  log)
+    touch "$LOG"; tail -n 40 -f "$LOG" ;;
+  report)
+    out="$HOME/Desktop/WifiCity report $(date '+%Y-%m-%d %H.%M').txt"
+    {
+      echo "== Status"; "$0" status
+      echo; echo "== Log"; tail -n 300 "$LOG"
+      echo; echo "== Sleep and wake"; pmset -g log | grep -E ' (Sleep|Wake|DarkWake) ' | tail -n 40
+      for f in portal.html response.html; do
+        [ -f "$STATE_DIR/$f" ] && { echo; echo "== $f"; head -c 6000 "$STATE_DIR/$f"; }
+      done
+    } > "$out" 2>&1
+    echo "Report saved to: $out"; open -R "$out" ;;
+  uninstall)
+    pkill -f "WifiCity AutoLogin.app/Contents/MacOS" 2>/dev/null
+    rm -rf "$MENU_APP" "$APP_DIR" "$LOG" "$LOG.old"
+    security delete-generic-password -s "$KC_SERVICE" >/dev/null 2>&1
+    [ -L /usr/local/bin/wificity ] && rm -f /usr/local/bin/wificity
+    echo "WifiCity AutoLogin has been removed." ;;
+  *)
+    sed -n '5,11p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac
